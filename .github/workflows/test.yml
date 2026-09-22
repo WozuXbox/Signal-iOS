@@ -1,0 +1,97 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app
+  WORKSPACE: Signal.xcworkspace
+  SCHEME: Signal
+  CONFIGURATION: Release
+  ARCHIVE_PATH: ${{ github.workspace }}/build/Signal.xcarchive
+  IPA_DIR: ${{ github.workspace }}/build/ipa
+
+jobs:
+  build-unsigned-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-26-xlarge
+    timeout-minutes: 90
+
+    steps:
+      - name: Set Xcode version
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_26.6.app" >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check Xcode version
+        run: Scripts/check_xcode_version.py --relaxed
+
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Download iOS runtime
+        run: xcodebuild -downloadPlatform iOS
+
+      - name: Check out submodules and prepare Signal dependencies
+        uses: ./.github/actions/clone-everything
+        with:
+          access-token: ${{ secrets.ACCESS_TOKEN }}
+
+      - name: Set up Ruby and Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Install CocoaPods dependencies
+        run: |
+          make dependencies
+          bundle exec pod install --repo-update
+
+      - name: Archive without code signing
+        run: |
+          set -euo pipefail
+          rm -rf "$ARCHIVE_PATH" "$IPA_DIR"
+          mkdir -p "$(dirname "$ARCHIVE_PATH")" "$IPA_DIR"
+
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -allowProvisioningUpdates \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          app_path="$(find "$ARCHIVE_PATH/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo 'No .app was found in the archive.' >&2
+            exit 1
+          fi
+
+          mkdir -p "$IPA_DIR/Payload"
+          cp -R "$app_path" "$IPA_DIR/Payload/"
+          (cd "$IPA_DIR" && zip -qry Signal-unsigned.ipa Payload)
+          rm -rf "$IPA_DIR/Payload"
+
+          echo "Created $IPA_DIR/Signal-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v6
+        with:
+          name: Signal-unsigned-ipa
+          path: build/ipa/Signal-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
